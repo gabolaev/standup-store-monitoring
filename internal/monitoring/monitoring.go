@@ -15,6 +15,31 @@ const (
 	standUpStoreURL = "https://standupstore.ru/"
 )
 
+var (
+	monthNameReplacer = strings.NewReplacer(
+		"Январь", "января",
+		"Февраль", "февраля",
+		"Март", "марта",
+		"Апрель", "апреля",
+		"Май", "мая",
+		"Июнь", "июня",
+		"Июль", "июля",
+		"Август", "августа",
+		"Сентябрь", "сентября",
+		"Октябрь", "октября",
+		"Ноябрь", "ноября",
+		"Декабрь", "декабря",
+	)
+
+	escapeReplacer = strings.NewReplacer(
+		"(", "\\(",
+		")", "\\)",
+		"+", "\\+",
+		"-", "\\-",
+		"  ", " ",
+	)
+)
+
 type Watcher struct {
 	httpClient http.Client
 	logger     *zap.Logger
@@ -31,33 +56,64 @@ func NewWatcher(logger *zap.Logger, interval time.Duration) Watcher {
 	}
 }
 
-func (w *Watcher) findNewInStockEvents(doc *goquery.Document) []Event {
-	events := make([]Event, 0, len(w.cache))
+func (w *Watcher) enrichWithMeta(event *Event) {
+	resp, err := w.httpClient.Get(event.Book)
+	if err != nil {
+		w.logger.Error("unable to get book page", zap.Error(err), zap.String("url", event.Book))
+		return
+	}
+	bookDoc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		w.logger.Error("unable to parse book page", zap.Error(err), zap.String("url", event.Book))
+		return
+	}
+	_ = resp.Body.Close()
 
+	if price, found := bookDoc.Find(".price.tx_price_line").Attr("content"); found {
+		event.Price = price + "₽"
+	} else {
+		event.Price = "Бесплатно"
+	}
+
+	if description := bookDoc.Find(".eventon_desc_in").Text(); description != "" {
+		event.Description = strings.TrimSpace(escapeReplacer.Replace(description))
+	} else {
+		event.Description = "Описание отсутствует"
+	}
+
+	if remaining := bookDoc.Find(".evotx_remaining_stock").Text(); remaining != "" {
+		event.Remaining = fmt.Sprintf("*%s*", remaining)
+	} else {
+		event.Remaining = "Осталось много билетов"
+	}
+
+	if cardTime := bookDoc.Find(".evo_eventcard_time_t").Text(); cardTime != "" {
+		event.Time = escapeReplacer.Replace(cardTime)
+	}
+}
+
+func (w *Watcher) streamNewEvents(doc *goquery.Document, stream chan Event) {
 	doc.Find(".evo_above_title").Each(func(i int, s *goquery.Selection) {
 		if len(s.Children().Nodes) == 0 {
 			core := s.Parent().Parent()
 
 			book, _ := core.Parent().Parent().Find("a").First().Attr("href")
 			newEvent := Event{
-				Date: fmt.Sprintf("%s %s", core.Find(".date").Text(), strings.Title(core.Find(".month").Text())),
-				Time: core.Find(".evcal_desc2.evcal_event_title").Text(),
+				Date: fmt.Sprintf("%s %s", core.Find(".date").Text(), monthNameReplacer.Replace(strings.Title(core.Find(".month").Text()))),
 				Book: book,
 			}
+			w.enrichWithMeta(&newEvent)
 
 			hashSum := newEvent.GetSum()
 			if _, cached := w.cache[hashSum]; !cached {
 				w.cache[hashSum] = struct{}{}
-				events = append(events, newEvent)
+				if stream != nil {
+					stream <- newEvent
+				}
 			}
 		}
 	})
-	if len(events) > 0 {
-		w.logger.Debug("found new events", zap.Int("count", len(events)))
-	} else {
-		w.logger.Debug("no new events")
-	}
-	return events
+	return
 }
 
 func (w *Watcher) Watch(shutdown <-chan os.Signal) chan Event {
@@ -75,6 +131,7 @@ func (w *Watcher) Watch(shutdown <-chan os.Signal) chan Event {
 				w.logger.Info("updates channel closed")
 				return
 			case <-tick.C:
+				w.logger.Info("fetching new events", zap.String("url", standUpStoreURL))
 				resp, err := w.httpClient.Get(standUpStoreURL)
 				if err != nil {
 					w.logger.Error("unable to make http request", zap.Error(err), zap.String("url", standUpStoreURL))
@@ -88,12 +145,13 @@ func (w *Watcher) Watch(shutdown <-chan os.Signal) chan Event {
 					continue
 				}
 
-				for _, newEvent := range w.findNewInStockEvents(doc) {
-					if send {
-						updatesChan <- newEvent
-					}
+				if send {
+					w.streamNewEvents(doc, updatesChan)
+				} else {
+					w.streamNewEvents(doc, nil)
+					send = true
 				}
-				send = true
+				w.logger.Info("finished new events streaming iteration", zap.String("url", standUpStoreURL))
 				tick = time.NewTicker(w.interval)
 			}
 		}

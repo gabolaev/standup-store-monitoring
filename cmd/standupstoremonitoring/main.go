@@ -19,6 +19,10 @@ var (
 	envCheckInterval = os.Getenv("CHECK_INTERVAL")
 )
 
+const (
+	maxRetryCount = 10
+)
+
 func main() {
 	log, err := logger.New()
 	if err != nil {
@@ -47,23 +51,28 @@ func main() {
 
 	watcher := monitoring.NewWatcher(log, checkInterval)
 	for newEvent := range watcher.Watch(shutdownChan) {
-		for {
-			text := newEvent.BuildMessage()
-			msg := tgbotapi.MessageConfig{
-				BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
-				Text:                  text,
-				ParseMode:             "MarkdownV2",
-				DisableWebPagePreview: false,
+		text := newEvent.BuildMessage()
+		msg := tgbotapi.MessageConfig{
+			BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+			Text:                  text,
+			ParseMode:             "MarkdownV2",
+			DisableWebPagePreview: false,
+		}
+		for i := 0; i < maxRetryCount; i++ {
+			select {
+			case <-shutdownChan:
+				return
+			default:
+				_, err := bot.Send(msg)
+				if err != nil {
+					log.Error("unable to send message", zap.Error(err), zap.String("message", text))
+					time.Sleep(5 * time.Second)
+					continue
+				}
 			}
-			_, err := bot.Send(msg)
-			if err != nil {
-				log.Error("unable to send message", zap.Error(err))
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			time.Sleep(2 * time.Second)
-			log.Info("message sent", zap.String("message raw text", newEvent.BuildMessage()))
 			break
 		}
+		time.Sleep(2 * time.Second)
+		log.Info("message sent", zap.String("message raw text", text))
 	}
 }
